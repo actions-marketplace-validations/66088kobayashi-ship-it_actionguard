@@ -5,7 +5,8 @@
 [![license](https://img.shields.io/github/license/66088kobayashi-ship-it/actionguard)](LICENSE)
 
 Static analysis for Next.js Server Actions: does a caller-supplied identifier reach a
-`service_role` database query without passing a guard?
+privileged database query — a Supabase `service_role` client or, since v0.5.0, a Drizzle
+client (experimental) — without passing a guard?
 
 ```bash
 npx @kobahiro/actionguard <path-to-repo>
@@ -25,7 +26,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: 66088kobayashi-ship-it/actionguard@v0.4.0
+      - uses: 66088kobayashi-ship-it/actionguard@v0.7.0
         # with:
         #   path: apps/web              # where the Next.js app lives
         #   fail-on-findings: "false"   # report without failing the job
@@ -94,6 +95,9 @@ only `parsedInput` is treated as caller-supplied.
 | `weak_guard` | guarded, but the check reads `user_metadata`, which users can rewrite with `supabase.auth.updateUser` | 1 |
 | `ignored` | would be reported, but marked `// actionguard-ignore: <reason>` | 0 |
 | `unreferenced` | would be flagged, but on Next.js ≥ 15 no client code references it, so it gets no action ID | 0 |
+| `env_gated` | unguarded, but returns or throws early unless an opt-in flag allows it (`DEMO_MODE !== "true"`, `!ENABLE_RESET`) or when running in production (`NODE_ENV === "production"`). A check that a setting exists (`!process.env.SUPABASE_SERVICE_ROLE_KEY`) is not a gate and stays `flagged`. A misconfigured deployment still exposes it | 0 |
+| `idor_candidate` | **experimental** — a login check runs first, but a caller-supplied value picks the rows (an id-like column, an Admin API target, the owner column of a new row) and neither the query nor any check involves the session user. Listed under "Possible IDOR"; never fails the run | 0 |
+| `no_auth` | flagged, in a repository with no auth library and no auth call anywhere. Still reported (exit 1), but as **one** finding for the repository: the fix is "add authentication", not N separate checks | 1 |
 | `public_write` | only inserts caller values into content columns of a public-submission table (contact, feedback, waitlist, reports...). Any `*_id`, role, owner or status column keeps it `flagged` | 0 |
 | `guard_before_sink` / `no_tainted_sink` | passed | 0 |
 
@@ -102,7 +106,12 @@ export counts as referenced when a client module imports it (a `"use client"` fi
 module such a file imports, directly or through barrels and `import()`), or when a server
 component passes it on as a value (`<form action={save}>`, a prop) instead of calling it.
 Type-only imports and test files do not count. Only the names actually imported through a
-barrel count, not everything it re-exports. It is still worth fixing: the
+barrel count, not everything it re-exports. The same goes for `import()`: when client code
+destructures it directly (`import("./m").then(({ a }) => ...)`, `const { a } = await import("./m")`),
+only those names count. Checked against a next@16.2.0 build: the
+other exports get a server-side ID that changes every build and is never sent to the browser.
+Holding the module in a variable (`const m = await import("./m"); m.a()`) or loading it through
+`Promise.all([import("./m"), ...])` ships every export's ID, so all of them count. It is still worth fixing: the
 day a client component imports it, it becomes an endpoint.
 
 Exit code 1 if anything is `flagged` or `weak_guard`, so it drops into CI.
@@ -201,6 +210,71 @@ actions, which look exactly like the account-takeover sign-ups among the real fi
 
 > Everything below this point is the original study, run with v0.1.0 (guards matched by name
 > prefix only, no helper or destructuring support). Kept for the record.
+
+### Drizzle (experimental, v0.5.0)
+
+A Drizzle client connects with the app's own database credentials, so there is no
+row-level security between a Server Action and the data: every Drizzle query is as
+privileged as a Supabase `service_role` query. v0.5.0 scans Drizzle actions with the same
+taint and guard analysis. Sinks are `.where()`, `.set()`, `.values()`,
+`.onConflictDoUpdate()` and `db.query.<table>.findFirst/findMany({ where })` on chains
+rooted at a `drizzle(...)` client, a lazily built one (`db()`, `getDb()`, a Proxy, `this.db`)
+in a file that imports `drizzle-orm`, or the `tx` of `db.transaction()`. Each finding
+carries `db: "supabase" | "drizzle"`.
+
+Measured on 124 repositories that import `drizzle-orm` from `"use server"` files (GitHub
+code search, November 2026): 78 had a reported action. I hand-read 60 reported actions
+(at most two per repository in the second batch). After two fixes found during that review
+— helpers that return a result object (`if (!guard.ok) return guard`) backed by a
+Web Crypto HMAC session, and early `process.env` exits now reported as `env_gated` —
+35 of the 55 remaining were real (**about 64%**). The rest were mostly public on purpose,
+gated by a secret token, or a single-user local app. Treat it as experimental: the sample
+is small and the shapes of Drizzle code vary more than Supabase's.
+
+### Authorization / IDOR (experimental, v0.6.0)
+
+A login check is not authorization. `await requireUser()` followed by
+`.delete().eq("id", id)` lets any signed-in user delete anyone's row. Until v0.6.0 that
+passed as `guard_before_sink`. Now it is reported as `idor_candidate` when:
+
+- the caller's value is used as a key: an id-like column in `.eq/.in/.match`, Drizzle
+  `eq(table.xId, ...)`, a Supabase Admin API target, or an owner column of an insert
+  (`user_id`, `orgId`, `created_by`...; a foreign key to a shared row such as `productId`
+  does not count), and
+- the statement that runs the query does not use anything derived from the session, and
+- nothing before it decides on the session user: a comparison (`row.owner_id !== user.id`),
+  a helper given both the session and the id (`assertMember(user.id, orgId)`), a guard given
+  the id (`authProject({ projectId })`), a role guard (`requireAdmin()`, a local guard whose
+  body checks a role or permission), or a server-side secret. A read may be checked after it
+  runs, as long as the check comes before anything is returned.
+
+Drizzle repositories whose tables have no owner-like column at all are treated as single-user
+and skipped.
+
+Measured on the 125 Drizzle repositories above plus 6 others (November 2026): 54 candidates
+in 13 repositories, out of about 2,900 actions that pass the login check. On 18 candidates I
+had not used while writing the rules: **6 real, 7 false, 5 unclear** (33% counting unclear as
+false, 46% without them). The false ones were mostly single-admin CMSs and internal tools
+where every signed-in person is staff, which the source alone cannot tell apart from a
+multi-tenant app. That is why it does not fail the run yet.
+
+### v0.7.0: one finding for apps with no authentication, and two rules that failed
+
+I tallied the reasons behind 1,175 false positives I had labelled by hand. The two biggest
+were "public on purpose" (309: catalog reads, logins, sign-ups, view counters; spread over
+135 repositories) and "single-user, demo, or no auth at all" (276; 54 repositories).
+Helpers the scanner missed were 135, but in only 13 repositories.
+
+I wrote three rules and ran them over the 410 repositories behind those labels (259 with
+labelled false positives, 213 with real findings), before and after:
+
+| Rule | What it did | Result |
+|---|---|---|
+| `public_read`: unguarded reads of non-sensitive tables, no sensitive join or column, no single-row read by key without a published/status filter | removed 97 of 307 "public on purpose" labels | **rejected**: hid real findings, for example `getPrivateWorkspaces` in four repositories, event attendee recipient lists, interview feedback. Private tables have too many names for a blocklist (`workspaces`, `streams`, `enrollments`, `attendance`...) |
+| `auth_flow`: logins ending in a password check, sign-ups where the caller cannot set a role, plan or owner id | removed most login/sign-up labels | **rejected**: hid four functions named in real reports (an admin login, three sign-ups) |
+| `no_auth`: the repository has no auth library and no auth call | grouped 360 functions in 78 repositories into 78 findings | **kept**: nothing stops being reported. Units to review that were labelled false: 1,143 → 905 (−20%); all units to review: 3,217 → 2,935 (−8%) |
+
+The rejected rules are kept as test fixtures that must stay `flagged`.
 
 ## The corpus
 

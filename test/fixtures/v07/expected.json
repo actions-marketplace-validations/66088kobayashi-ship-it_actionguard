@@ -1,0 +1,14 @@
+{
+  "searchProducts": "flagged",
+  "getProductById": "flagged",
+  "getPublishedPost": "flagged",
+  "getPostWithAuthor": "flagged",
+  "getOrdersByStatus": "flagged",
+  "loginAction": "flagged",
+  "signupAction": "flagged",
+  "signupWithRole": "flagged",
+  "registerUser": "flagged",
+  "joinWithResetLink": "flagged",
+  "listCourses": "flagged",
+  "getCourseWithUser": "flagged"
+}

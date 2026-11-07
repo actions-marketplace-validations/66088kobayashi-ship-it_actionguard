@@ -1,0 +1,12 @@
+{
+  "deleteNote": "flagged",
+  "getNoteById": "flagged",
+  "updateNote": "flagged",
+  "deleteMyNote": "guard_before_sink",
+  "moveNote": "flagged",
+  "archiveNote": "guard_before_sink",
+  "demoResetNote": "env_gated",
+  "purgeNote": "flagged",
+  "devWipeNote": "env_gated",
+  "prodOnlyDelete": "flagged"
+}
